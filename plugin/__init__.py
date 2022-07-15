@@ -41,11 +41,72 @@ from anki.exporting import AnkiPackageExporter
 from anki.importing import AnkiPackageImporter
 from anki.notes import Note
 from anki.errors import NotFoundError
-from aqt.qt import Qt, QTimer, QMessageBox, QCheckBox
+from aqt.qt import Qt, QTimer, QMessageBox, QCheckBox, QAction
 
 from .web import format_exception_reply, format_success_reply
 from .edit import Edit
 from . import web, util
+
+
+checksums = set()
+queryToNoteIds = dict()
+anki_add_note = None
+anki_remove_notes = None
+anki_update_note = None
+
+
+def add_note(self, note, deck_id):
+    changes = anki_add_note(self, note, deck_id)
+    addNoteToCache(note)
+    return changes
+
+
+def remove_notes(self, note_ids):
+    removeNotesFromCache(note_ids)
+    return anki_remove_notes(self, note_ids)
+
+
+def update_note(self, note):
+    removeNotesFromCache([note.id])
+    changes = anki_update_note(self, note)
+    addNoteToCache(note)
+    return changes
+
+
+def addNoteToCache(note):
+    firstFieldValue = note.fields[0]
+    checksum = anki.utils.field_checksum(firstFieldValue)
+    checksums.add(checksum)
+
+    model = aqt.mw.col.models.get(note.mid)
+    firstFieldName = aqt.mw.col.models.field_names(model)[0]
+
+    query = getQueryFromFields(firstFieldName, firstFieldValue)
+    if query not in queryToNoteIds:
+        queryToNoteIds[query] = [note.id]
+    else:
+        queryToNoteIds[query].append(note.id)
+
+
+def removeNotesFromCache(noteIds):
+    for noteId in noteIds:
+        note = aqt.mw.col.get_note(noteId)
+        firstFieldValue = note.fields[0]
+        checksum = anki.utils.field_checksum(firstFieldValue)
+        checksums.remove(checksum)
+
+        model = aqt.mw.col.models.get(note.mid)
+        firstFieldName = aqt.mw.col.models.field_names(model)[0]
+        query = getQueryFromFields(firstFieldName, firstFieldValue)
+        queryToNoteIds.get(query, []).remove(note.id)
+        if not queryToNoteIds[query]:
+            del queryToNoteIds[query]
+
+
+def getQueryFromFields(key, value):
+    key = key.lower()
+    value = value.replace("\"", "")
+    return f"\"{key}:{value}\""
 
 
 #
@@ -64,6 +125,11 @@ class AnkiConnect:
             self.log = open(logPath, 'w')
 
     def startWebServer(self):
+        # Add a menu item to build the cache because we need to wait for Anki to
+        # be fully loaded to have access to the collection
+        buildCacheAction = QAction("Build AnkiConnect cache", self.window(), triggered=self.buildCache)
+        self.window().form.menuTools.addAction(buildCacheAction)
+
         try:
             self.server.listen()
 
@@ -77,6 +143,28 @@ class AnkiConnect:
                 'AnkiConnect',
                 'Failed to listen on port {}.\nMake sure it is available and is not in use.'.format(util.setting('webBindPort'))
             )
+
+    def buildCache(self):
+        # Patch anki add and remove notes functions
+        global anki_add_note
+        global anki_remove_notes
+        global anki_update_note
+        anki_add_note = anki.Collection.add_note
+        anki_remove_notes = anki.Collection.remove_notes
+        anki_update_note = anki.Collection.update_note
+        anki.Collection.add_note = add_note
+        anki.Collection.remove_notes = remove_notes
+        anki.Collection.update_note = update_note
+
+        checksums = set()
+        queryToNoteIds = dict()
+
+        collection = self.collection()
+        noteIds = collection.db.list("select id from notes")
+
+        for noteId in noteIds:
+            note = collection.get_note(noteId)
+            addNoteToCache(note)
 
     def save_model(self, models, ankiModel):
         models.update_dict(ankiModel)
@@ -281,53 +369,14 @@ class AnkiConnect:
     ):
         # Returns: 1 if first is empty, 2 if first is a duplicate, 0 otherwise.
 
-        # note.dupeOrEmpty returns if a note is a global duplicate with the specific model.
-        # This is used as the default check, and the rest of this function is manually
-        # checking if the note is a duplicate with additional options.
-        if duplicateScope != 'deck' and not duplicateScopeCheckAllModels:
-            return note.dupeOrEmpty() or 0
-
         # Primary field for uniqueness
         val = note.fields[0]
         if not val.strip():
             return 1
-        csum = anki.utils.fieldChecksum(val)
 
-        # Create dictionary of deck ids
-        dids = None
-        if duplicateScope == 'deck':
-            did = deck['id']
-            if duplicateScopeDeckName is not None:
-                deck2 = collection.decks.byName(duplicateScopeDeckName)
-                if deck2 is None:
-                    # Invalid deck, so cannot be duplicate
-                    return 0
-                did = deck2['id']
-
-            dids = {did: True}
-            if duplicateScopeCheckChildren:
-                for kv in collection.decks.children(did):
-                    dids[kv[1]] = True
-
-        # Build query
-        query = 'select id from notes where csum=?'
-        queryArgs = [csum]
-        if note.id:
-            query += ' and id!=?'
-            queryArgs.append(note.id)
-        if not duplicateScopeCheckAllModels:
-            query += ' and mid=?'
-            queryArgs.append(note.mid)
-
-        # Search
-        for noteId in note.col.db.list(query, *queryArgs):
-            if dids is None:
-                # Duplicate note exists in the collection
-                return 2
-            # Validate that a card exists in one of the specified decks
-            for cardDeckId in note.col.db.list('select did from cards where nid=?', noteId):
-                if cardDeckId in dids:
-                    return 2
+        csum = anki.utils.field_checksum(val)
+        if csum in checksums:
+            return 2
 
         # Not a duplicate
         return 0
@@ -1199,7 +1248,7 @@ class AnkiConnect:
         if query is None:
             return []
 
-        return list(map(int, self.collection().findNotes(query)))
+        return queryToNoteIds.get(query, [])
 
 
     @util.api()
